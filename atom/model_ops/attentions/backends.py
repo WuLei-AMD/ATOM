@@ -101,7 +101,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
         self.max_num_blocks_per_seq = (
-            config.max_model_len + self.block_size - 1
+            config.max_model_len + self.block_size
         ) // self.block_size
 
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
@@ -139,9 +139,11 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
     def prepare_block_tables(self, batch: ScheduledBatch):
         var = self.model_runner.forward_vars
         block_tables = var["block_tables"].np
+        max_cols = block_tables.shape[1]
         for i, block_table in enumerate(batch.block_tables):
             block_tables[i] = 0
-            block_tables[i, : len(block_table)] = block_table
+            n = min(len(block_table), max_cols)
+            block_tables[i, :n] = block_table[:n]
 
     def prepare_prefill(self, batch: ScheduledBatch):
         bs = batch.total_seqs_num_prefill
