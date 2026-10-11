@@ -170,23 +170,28 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor):
+        # Slice the output, not the GEMM input. M=1 and M=seqlen do not match bitwise.
+        last_indices = None
         if not is_plugin_mode():
             forward_context: ForwardContext = get_forward_context()
             context = forward_context.context
             attn_metadata = forward_context.attn_metadata
-            # context = get_context()
             if context.is_prefill and not context.is_draft:
                 last_indices = attn_metadata.cu_seqlens_q[1:] - 1
-                x = x[last_indices].contiguous()
+        from atom.model_ops.linear import bitwise_place
+
+        placed = bitwise_place(x)
+        if placed is not None:
+            padded, pos = placed
+            logits = tgemm.mm(padded, self.weight, self.bias)
+            if self.tp_size > 1:
+                use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+                logits = tensor_model_parallel_all_gather(logits, use_custom=use_custom)
+            return logits[pos : pos + 1]
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
             use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
             logits = tensor_model_parallel_all_gather(logits, use_custom=use_custom)
-            # all_logits = (
-            #     [torch.empty_like(logits) for _ in range(self.tp_size)]
-            #     if self.tp_rank == 0
-            #     else None
-            # )
-            # dist.gather(logits, all_logits, 0)
-            # logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+        if last_indices is not None:
+            logits = logits[last_indices]
         return logits

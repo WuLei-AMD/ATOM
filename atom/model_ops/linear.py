@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from functools import partial as functools_partial
 from typing import Callable, Optional
 
@@ -34,6 +35,120 @@ from atom.utils.decorators import mark_trace
 from torch import nn
 
 logger = logging.getLogger("atom")
+
+o_proj_linear_count = 0
+
+_QKV_SPLITK1 = (
+    "flydsl_gemm5_abf16_wbf16_bf16_t64x64x128_split_k1_"
+    "block_m_warp2_block_n_warp2_block_k_warp2_"
+    "async_copyTrue_b_to_ldsTrue_b_preshuffleFalse_c_to_ldsFalse_gfx950"
+)
+_PAD_WEIGHTS = {(24576, 4096), (4096, 12288)}
+_PAD_WORKSPACES = {}
+
+
+def bitwise_m() -> int:
+    raw = os.environ.get("ATOM_BITWISE_M", "")
+    return int(raw) if raw else 0
+
+
+def bitwise_position(ctx=None) -> int:
+    """Read a decode position once per ForwardContext instead of once per op."""
+    if ctx is None:
+        from atom.utils.forward_context import get_forward_context
+
+        ctx = get_forward_context().context
+    if ctx is None or ctx.is_prefill:
+        return -1
+    pos = getattr(ctx, "_atom_bitwise_position", None)
+    if pos is None:
+        pos = int(ctx.positions.reshape(-1)[0].item())
+        ctx._atom_bitwise_position = pos
+    return pos
+
+
+def bitwise_place(activation):
+    """Put one decode row in a reusable prefill-shaped workspace."""
+    length = bitwise_m()
+    if length <= 1 or activation.dim() != 2 or activation.shape[0] != 1:
+        return None
+    from atom.utils.forward_context import get_forward_context
+
+    ctx = get_forward_context().context
+    if ctx is None or ctx.is_prefill:
+        return None
+    pos = bitwise_position(ctx)
+    if pos < 0 or pos >= length:
+        return None
+    key = (activation.device, activation.dtype, length, activation.shape[-1])
+    workspace = _PAD_WORKSPACES.get(key)
+    if workspace is None:
+        padded = torch.zeros(
+            length, activation.shape[-1], dtype=activation.dtype, device=activation.device
+        )
+    else:
+        padded = workspace
+    padded[pos : pos + 1] = activation
+    _PAD_WORKSPACES[key] = padded
+    return padded, pos
+
+
+def _o_proj_linear(activation, weight, bias):
+    """o_proj GEMM. The tuned ASM split-K kernel is not bitwise across launches."""
+    global o_proj_linear_count
+    import torch.nn.functional as F
+
+    o_proj_linear_count += 1
+    placed = bitwise_place(activation)
+    if placed is not None:
+        padded, pos = placed
+        return F.linear(padded, weight, bias)[pos : pos + 1]
+    if activation.dim() >= 3:
+        flat = activation.reshape(-1, activation.size(-1))
+        out = F.linear(flat, weight, bias)
+        return out.view(*activation.shape[:-1], weight.shape[0])
+    return F.linear(activation, weight, bias)
+
+
+def _tp_cat(shard: torch.Tensor, dim: int) -> torch.Tensor:
+    return get_tp_group().all_gather(shard.contiguous(), use_custom=False, dim=dim)
+
+
+def _restore_tokens(out: torch.Tensor, shape, width: int) -> torch.Tensor:
+    if shape is None:
+        return out
+    return out.view(*shape[:-1], width)
+
+
+def _column_same_n(layer, activation, otype):
+    """Gather each logical output shard to the unsharded N, run that GEMM, keep local rows."""
+    flat = activation.reshape(-1, activation.size(-1)) if activation.dim() >= 3 else activation
+    shape = activation.shape if activation.dim() >= 3 else None
+    sizes = [int(size) for size in layer.output_partition_sizes]
+    parts = layer.weight.split(sizes, dim=0)
+    full_weight = torch.cat([_tp_cat(part, 0) for part in parts], dim=0)
+    out = tgemm.mm(flat, full_weight, layer.bias, otype=otype)
+    rows = []
+    offset = 0
+    for local in sizes:
+        width = local * layer.tp_size
+        rows.append(out[:, offset + layer.tp_rank * local : offset + (layer.tp_rank + 1) * local])
+        offset += width
+    local = torch.cat(rows, dim=-1)
+    return _restore_tokens(local, shape, layer.weight.shape[0])
+
+
+def _row_same_k(layer, activation, otype):
+    """Gather the K-split activation and weight, then run the unsharded GEMM."""
+    flat = activation.reshape(-1, activation.size(-1)) if activation.dim() >= 3 else activation
+    shape = activation.shape if activation.dim() >= 3 else None
+    full_x = _tp_cat(flat, -1)
+    full_weight = _tp_cat(layer.weight, 1)
+    if layer.prefix.endswith("o_proj"):
+        out = _o_proj_linear(full_x, full_weight, layer.bias)
+    else:
+        out = tgemm.mm(full_x, full_weight, layer.bias, otype=otype)
+    return _restore_tokens(out, shape, full_weight.shape[0])
 
 
 def use_triton_gemm() -> bool:
@@ -389,13 +504,57 @@ class LinearBase(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
-        if self.quant_type.value == QuantType.No.value:
-            y = tgemm.mm(
-                x,
-                self.weight,
-                self.bias,
-                otype=otype,
-            )
+        skip_reduce = False
+        same_contract = (
+            self.quant_type.value == QuantType.No.value
+            and self.tp_size > 1
+            and self.bias is None
+            and getattr(self, "num_kv_head_replicas", 1) == 1
+        )
+        if same_contract and self.tp_dim == 0:
+            y = _column_same_n(self, x, otype)
+        elif same_contract and self.tp_dim == 1 and self.reduce_results:
+            y = _row_same_k(self, x, otype)
+            skip_reduce = True
+        elif self.quant_type.value == QuantType.No.value:
+            if self.prefix.endswith("o_proj"):
+                y = _o_proj_linear(x, self.weight, self.bias)
+            elif (
+                tuple(self.weight.shape) == (6144, 4096)
+                and x.shape[0] == 1
+                and bitwise_m() > 1
+            ):
+                from aiter.tuned_gemm import flydsl_gemm
+
+                y = flydsl_gemm(
+                    x,
+                    self.weight,
+                    4696,
+                    bias=self.bias,
+                    otype=otype,
+                    config={"kernelName": _QKV_SPLITK1},
+                )
+            else:
+                placed = (
+                    bitwise_place(x)
+                    if tuple(self.weight.shape) in _PAD_WEIGHTS
+                    else None
+                )
+                if placed is None:
+                    y = tgemm.mm(
+                        x,
+                        self.weight,
+                        self.bias,
+                        otype=otype,
+                    )
+                else:
+                    padded, pos = placed
+                    y = tgemm.mm(
+                        padded,
+                        self.weight,
+                        self.bias,
+                        otype=otype,
+                    )[pos : pos + 1]
         else:
             if x_scale is None:
                 quant_func = self.quant_func
@@ -462,7 +621,7 @@ class LinearBase(nn.Module):
                 )
                 if self.bias is not None:
                     y += self.bias
-        if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
+        if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results and not skip_reduce:
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         return y
 

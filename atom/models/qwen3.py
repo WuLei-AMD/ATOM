@@ -33,6 +33,7 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.rotary_embedding import get_rope
 from atom.config import Config
 from atom.model_ops.activation import SiluAndMul
+import atom.model_ops.linear as linear_ops
 
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention
@@ -44,6 +45,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.utils.decorators import support_torch_compile
+from atom.utils.forward_context import get_forward_context
 from torch import nn
 from transformers import Qwen3Config
 
@@ -126,13 +128,30 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         **model_kwargs: dict[str, Any] | None,
     ) -> torch.Tensor:
+        context = get_forward_context().context
+        aligned_decode = (
+            linear_ops.bitwise_m() > 1
+            and context is not None
+            and not context.is_prefill
+            and hidden_states.shape[0] == linear_ops.bitwise_m()
+        )
         qkv = self.qkv_proj(hidden_states)
+        if aligned_decode:
+            pos = linear_ops.bitwise_position(context)
+            qkv = qkv[pos : pos + 1]
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
 
         o = self.attn(q, k, v, positions, **model_kwargs)
+        if aligned_decode:
+            if not hasattr(self, "_bit_o"):
+                self._bit_o = torch.zeros(
+                    linear_ops.bitwise_m(), o.shape[-1], dtype=o.dtype, device=o.device
+                )
+            self._bit_o[pos : pos + 1].copy_(o)
+            o = self._bit_o
         output = self.o_proj(o)
         return output
 
@@ -267,6 +286,24 @@ class Qwen3Model(nn.Module):
         **model_kwargs: dict[str, Any],
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
+        context = get_forward_context().context
+        aligned_decode = (
+            linear_ops.bitwise_m() > 1
+            and context is not None
+            and not context.is_prefill
+            and hidden_states.shape[0] == 1
+        )
+        if aligned_decode:
+            pos = linear_ops.bitwise_position(context)
+            if not hasattr(self, "_bit_hidden"):
+                self._bit_hidden = torch.zeros(
+                    linear_ops.bitwise_m(),
+                    hidden_states.shape[-1],
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+            self._bit_hidden[pos : pos + 1].copy_(hidden_states)
+            hidden_states = self._bit_hidden
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(
@@ -277,6 +314,8 @@ class Qwen3Model(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        if aligned_decode:
+            hidden_states = hidden_states[pos : pos + 1]
         return hidden_states
 
 

@@ -402,6 +402,42 @@ class PagedAttentionImpl(nn.Module):
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
 
+        from atom.model_ops.linear import bitwise_m, bitwise_position
+
+        if bitwise_m() > 1 and fwd_ctx.context is not None and not fwd_ctx.context.is_prefill:
+            pos = bitwise_position(fwd_ctx.context)
+            length = bitwise_m()
+            if pos == 0 or not hasattr(self, "_bit_k"):
+                self._bit_k = torch.empty(
+                    (length, *k.shape[1:]), dtype=k.dtype, device=k.device
+                )
+                self._bit_v = torch.empty(
+                    (length, *v.shape[1:]), dtype=v.dtype, device=v.device
+                )
+            self._bit_k[pos : pos + 1].copy_(k)
+            self._bit_v[pos : pos + 1].copy_(v)
+            key = self._bit_k[: pos + 1]
+            value = self._bit_v[: pos + 1]
+            window = (
+                (self.sliding_window, 0, 0)
+                if self.sliding_window is not None
+                else (-1, -1, 0)
+            )
+            return aiter.flash_attn_varlen_func(
+                q,
+                key,
+                value,
+                cu_seqlens_q=torch.tensor([0, q.shape[0]], dtype=torch.int32, device=q.device),
+                cu_seqlens_k=torch.tensor([0, key.shape[0]], dtype=torch.int32, device=q.device),
+                max_seqlen_q=q.shape[0],
+                max_seqlen_k=key.shape[0],
+                min_seqlen_q=q.shape[0],
+                dropout_p=0.0,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=window,
+                sink_ptr=self.sinks,
+            )
         attn_metadata = fwd_ctx.attn_metadata
         o = aiter.pa_fwd_asm(
             q,
