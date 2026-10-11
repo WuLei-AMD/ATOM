@@ -135,25 +135,71 @@ class Qwen3Attention(nn.Module):
             and not context.is_prefill
             and hidden_states.shape[0] == linear_ops.bitwise_m()
         )
-        qkv = self.qkv_proj(hidden_states)
-        if aligned_decode:
-            pos = linear_ops.bitwise_position(context)
-            qkv = qkv[pos : pos + 1]
+        pos = linear_ops.bitwise_position(context) if aligned_decode else -1
+        # M=1 split_k1 matches this row of the prefill QKV. The other 92 rows are unused.
+        qkv_in = hidden_states[pos : pos + 1] if aligned_decode else hidden_states
+        qkv = self.qkv_proj(qkv_in)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q = self.q_norm(q)
-        k = self.k_norm(k)
+        if aligned_decode:
+            k = self._norm_k_into_history(k, pos)
+        else:
+            k = self.k_norm(k)
 
+        if aligned_decode and not hasattr(self, "_bit_o"):
+            self._bit_o = torch.zeros(
+                linear_ops.bitwise_m(),
+                self.q_size,
+                dtype=q.dtype,
+                device=q.device,
+            )
+        if aligned_decode:
+            context._atom_attn_out = self._bit_o[pos : pos + 1]
         o = self.attn(q, k, v, positions, **model_kwargs)
         if aligned_decode:
-            if not hasattr(self, "_bit_o"):
-                self._bit_o = torch.zeros(
-                    linear_ops.bitwise_m(), o.shape[-1], dtype=o.dtype, device=o.device
-                )
-            self._bit_o[pos : pos + 1].copy_(o)
+            context._atom_attn_out = None
+            slot = self._bit_o[pos : pos + 1]
+            if o.data_ptr() != slot.data_ptr():
+                slot.copy_(o.view_as(slot))
             o = self._bit_o
         output = self.o_proj(o)
         return output
+
+    def _norm_k_into_history(self, k: torch.Tensor, pos: int) -> torch.Tensor:
+        """Write K into the attention history so RoPE updates it in place."""
+        from aiter.ops.rmsnorm import rmsnorm
+
+        attn = self.attn
+        length = linear_ops.bitwise_m()
+        if (
+            not hasattr(attn, "_bit_k")
+            or attn._bit_k.shape[0] != length
+            or attn._bit_k.shape[1] != self.num_kv_heads
+            or attn._bit_k.shape[2] != self.head_dim
+        ):
+            attn._bit_k = torch.empty(
+                length,
+                self.num_kv_heads,
+                self.head_dim,
+                dtype=k.dtype,
+                device=k.device,
+            )
+            attn._bit_v = torch.empty(
+                length,
+                self.num_kv_heads,
+                self.head_dim,
+                dtype=k.dtype,
+                device=k.device,
+            )
+        slot = attn._bit_k[pos : pos + 1]
+        rmsnorm(
+            slot.view(-1, self.head_dim),
+            k.view(-1, self.head_dim),
+            self.k_norm.weight,
+            self.k_norm.eps,
+        )
+        return slot.view(k.shape)
 
 
 class Qwen3MLP(nn.Module):

@@ -205,7 +205,15 @@ class PagedAttentionImpl(nn.Module):
                 q = self.q_norm(q)
             if self.k_norm is not None:
                 k = self.k_norm(k)
-            if self.kv_cache_dtype == "fp8":
+            from atom.model_ops.linear import bitwise_m
+
+            aligned_decode = (
+                bitwise_m() > 1
+                and fwd_ctx.context is not None
+                and not fwd_ctx.context.is_prefill
+            )
+            # Bitwise decode reads the logical K/V history, not the paged cache.
+            if not aligned_decode and self.kv_cache_dtype == "fp8":
                 aiter.reshape_and_cache_with_pertoken_quant(
                     k,
                     v,
@@ -216,7 +224,7 @@ class PagedAttentionImpl(nn.Module):
                     attn_metadata.slot_mapping,
                     asm_layout=asm_layout,
                 )
-            else:
+            elif not aligned_decode:
                 aiter.reshape_and_cache(
                     k,
                     v,
@@ -397,6 +405,18 @@ class PagedAttentionImpl(nn.Module):
 
         return o
 
+    def _bitwise_cu(self, q_len: int, k_len: int, device):
+        """Reuse [0, length] index vectors. Decode used to allocate these every layer."""
+        table = getattr(self, "_bit_cu", None)
+        if table is None or table.device != device or table.shape[0] <= k_len:
+            from atom.model_ops.linear import bitwise_m
+
+            width = max(k_len + 1, q_len + 1, bitwise_m() + 1)
+            table = torch.zeros(width, 2, dtype=torch.int32, device=device)
+            table[:, 1] = torch.arange(width, device=device, dtype=torch.int32)
+            self._bit_cu = table
+        return table[q_len], table[k_len]
+
     @mark_trace(prefix="paged_attention_asm", torch_compile=False)
     def paged_attention_asm(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -407,15 +427,23 @@ class PagedAttentionImpl(nn.Module):
         if bitwise_m() > 1 and fwd_ctx.context is not None and not fwd_ctx.context.is_prefill:
             pos = bitwise_position(fwd_ctx.context)
             length = bitwise_m()
-            if pos == 0 or not hasattr(self, "_bit_k"):
+            if (
+                not hasattr(self, "_bit_k")
+                or self._bit_k.shape[0] != length
+                or self._bit_k.shape[1:] != k.shape[1:]
+            ):
                 self._bit_k = torch.empty(
                     (length, *k.shape[1:]), dtype=k.dtype, device=k.device
                 )
                 self._bit_v = torch.empty(
                     (length, *v.shape[1:]), dtype=v.dtype, device=v.device
                 )
-            self._bit_k[pos : pos + 1].copy_(k)
-            self._bit_v[pos : pos + 1].copy_(v)
+            k_slot = self._bit_k[pos : pos + 1]
+            v_slot = self._bit_v[pos : pos + 1]
+            if k.data_ptr() != k_slot.data_ptr():
+                k_slot.copy_(k)
+            if v.data_ptr() != v_slot.data_ptr():
+                v_slot.copy_(v)
             key = self._bit_k[: pos + 1]
             value = self._bit_v[: pos + 1]
             window = (
@@ -423,12 +451,17 @@ class PagedAttentionImpl(nn.Module):
                 if self.sliding_window is not None
                 else (-1, -1, 0)
             )
-            return aiter.flash_attn_varlen_func(
+            cu_q, cu_k = self._bitwise_cu(q.shape[0], key.shape[0], q.device)
+            dest = getattr(fwd_ctx.context, "_atom_attn_out", None)
+            attn_out = None
+            if dest is not None and dest.shape[0] == q.shape[0]:
+                attn_out = dest.view(q.shape[0], self.num_heads, self.head_dim)
+            result = aiter.flash_attn_varlen_func(
                 q,
                 key,
                 value,
-                cu_seqlens_q=torch.tensor([0, q.shape[0]], dtype=torch.int32, device=q.device),
-                cu_seqlens_k=torch.tensor([0, key.shape[0]], dtype=torch.int32, device=q.device),
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
                 max_seqlen_q=q.shape[0],
                 max_seqlen_k=key.shape[0],
                 min_seqlen_q=q.shape[0],
@@ -437,7 +470,11 @@ class PagedAttentionImpl(nn.Module):
                 causal=True,
                 window_size=window,
                 sink_ptr=self.sinks,
+                out=attn_out,
             )
+            if isinstance(result, tuple):
+                result = result[0]
+            return result
         attn_metadata = fwd_ctx.attn_metadata
         o = aiter.pa_fwd_asm(
             q,
